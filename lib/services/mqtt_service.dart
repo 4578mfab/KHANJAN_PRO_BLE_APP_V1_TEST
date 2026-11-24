@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'package:http/http.dart' as http;
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import '../models/app_settings.dart';
@@ -35,7 +37,6 @@ class MqttService {
     return '$scheme://$host/mqtt';
   }
 
-  /// آیا IP یک آدرس خصوصی است؟ (مثل 10.x یا 192.168.x)
   bool _isPrivateIp(String ip) {
     final parts = ip.split('.');
     if (parts.length != 4) return false;
@@ -48,7 +49,6 @@ class MqttService {
     return false;
   }
 
-  /// بررسی می‌کند گواهی برای دامنه مورد نظر ما صادر شده باشد
   bool _isCertificateForDomain(X509Certificate cert, String expectedDomain) {
     final domain = expectedDomain.trim().toLowerCase();
     if (domain.isEmpty) return false;
@@ -61,6 +61,55 @@ class MqttService {
     } catch (_) {}
 
     return false;
+  }
+
+  /// Resolve دامنه با DNS-over-HTTPS (Cloudflare) تا از DNS خراب موبایل رد شویم
+  Future<String?> _resolveWithDoH(String domain) async {
+    try {
+      final uri = Uri.parse(
+        'https://cloudflare-dns.com/dns-query?name=$domain&type=A',
+      );
+      final response = await http.get(
+        uri,
+        headers: {'Accept': 'application/dns-json'},
+      ).timeout(const Duration(seconds: 8));
+
+      if (response.statusCode != 200) return null;
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final answers = data['Answer'] as List<dynamic>?;
+      if (answers == null || answers.isEmpty) return null;
+
+      for (final answer in answers) {
+        final map = answer as Map<String, dynamic>;
+        if (map['type'] == 1) {
+          // نوع A
+          final ip = map['data'] as String?;
+          if (ip != null && !_isPrivateIp(ip)) {
+            return ip;
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Resolve دامنه: اول سیستم، اگر خراب بود از DoH استفاده کن
+  Future<String?> _resolveToPublicIpv4(String domain) async {
+    // ۱. اول با DNS سیستم (سریع‌تر)
+    try {
+      final addresses = await InternetAddress.lookup(
+        domain,
+        type: InternetAddressType.IPv4,
+      );
+      if (addresses.isNotEmpty) {
+        final ip = addresses.first.address;
+        if (!_isPrivateIp(ip)) return ip;
+      }
+    } catch (_) {}
+
+    // ۲. اگر سیستم IP خصوصی داد یا شکست خورد → از Cloudflare DoH
+    return await _resolveWithDoH(domain);
   }
 
   Future<void> connect(AppSettings settings) async {
@@ -82,40 +131,24 @@ class MqttService {
     final serverAddress =
         useWs ? _webSocketServerAddress(broker, mode) : broker;
 
-    // ---------- منطق اصلی برای اتصال پایدار روی موبایل ----------
     String hostForClient = serverAddress;
     bool connectedViaIp = false;
-
-    // اگر کاربر خودش IP وارد کرده
     final isAlreadyIp = RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(broker);
 
     if (!useWs && mode == 'tls') {
       if (isAlreadyIp) {
-        // کاربر مستقیم IP گذاشته
         hostForClient = broker;
         connectedViaIp = true;
       } else {
-        // دامنه است → سعی می‌کنیم به IPv4 عمومی resolve کنیم
-        try {
-          final addresses = await InternetAddress.lookup(
-            broker,
-            type: InternetAddressType.IPv4,
-          );
-
-          if (addresses.isNotEmpty) {
-            final ip = addresses.first.address;
-            if (!_isPrivateIp(ip)) {
-              hostForClient = ip;
-              connectedViaIp = true;
-            }
-            // اگر IP خصوصی برگشت، با همان دامنه ادامه می‌دهیم
-          }
-        } catch (_) {
-          // lookup شکست خورد → با دامنه ادامه بده
+        // دامنه را به IP عمومی resolve کن (با DoH در صورت نیاز)
+        final resolvedIp = await _resolveToPublicIpv4(broker);
+        if (resolvedIp != null) {
+          hostForClient = resolvedIp;
+          connectedViaIp = true;
         }
+        // اگر resolve کامل شکست خورد، با دامنه ادامه می‌دهیم
       }
     }
-    // ---------------------------------------------------------------
 
     _client = MqttServerClient.withPort(hostForClient, clientId, port);
     _client!.logging(on: false);
@@ -125,12 +158,9 @@ class MqttService {
     _client!.secure = mode == 'tls';
     _client!.connectTimeoutPeriod = 20000;
 
-    // وقتی با IP وصل می‌شویم، خطای hostname mismatch رخ می‌دهد.
-    // فقط در صورتی قبول می‌کنیم که گواهی واقعاً برای دامنه ما باشد.
     if (connectedViaIp && mode == 'tls') {
-      final expectedDomain = isAlreadyIp
-          ? 'khanjanhome.duckdns.org' // دامنه ثابت شما
-          : broker;
+      final expectedDomain =
+          isAlreadyIp ? 'khanjanhome.duckdns.org' : broker;
 
       _client!.onBadCertificate = (Object cert) {
         if (cert is X509Certificate) {
