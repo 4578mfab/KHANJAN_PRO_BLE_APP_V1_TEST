@@ -35,21 +35,29 @@ class MqttService {
     return '$scheme://$host/mqtt';
   }
 
-  /// بررسی می‌کند گواهی واقعاً برای دامنه مورد نظر صادر شده باشد
+  /// آیا IP یک آدرس خصوصی است؟ (مثل 10.x یا 192.168.x)
+  bool _isPrivateIp(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return false;
+    final a = int.tryParse(parts[0]) ?? 0;
+    final b = int.tryParse(parts[1]) ?? 0;
+    if (a == 10) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 127) return true;
+    return false;
+  }
+
+  /// بررسی می‌کند گواهی برای دامنه مورد نظر ما صادر شده باشد
   bool _isCertificateForDomain(X509Certificate cert, String expectedDomain) {
     final domain = expectedDomain.trim().toLowerCase();
     if (domain.isEmpty) return false;
 
     final subject = cert.subject.toLowerCase();
-    // معمولاً به شکل CN=khanjanhome.duckdns.org یا شامل دامنه است
-    if (subject.contains('cn=$domain') || subject.contains(domain)) {
-      return true;
-    }
+    if (subject.contains(domain)) return true;
 
-    // بررسی اضافی روی PEM (برای بعضی گواهی‌ها که SAN دارند)
     try {
-      final pem = cert.pem.toLowerCase();
-      if (pem.contains(domain)) return true;
+      if (cert.pem.toLowerCase().contains(domain)) return true;
     } catch (_) {}
 
     return false;
@@ -74,26 +82,37 @@ class MqttService {
     final serverAddress =
         useWs ? _webSocketServerAddress(broker, mode) : broker;
 
-    // ---------- راه‌حل اصلی مشکل Network is unreachable ----------
+    // ---------- منطق اصلی برای اتصال پایدار روی موبایل ----------
     String hostForClient = serverAddress;
-    bool usingIpInsteadOfDomain = false;
+    bool connectedViaIp = false;
+
+    // اگر کاربر خودش IP وارد کرده
+    final isAlreadyIp = RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(broker);
 
     if (!useWs && mode == 'tls') {
-      try {
-        final addresses = await InternetAddress.lookup(
-          broker,
-          type: InternetAddressType.IPv4,
-        );
+      if (isAlreadyIp) {
+        // کاربر مستقیم IP گذاشته
+        hostForClient = broker;
+        connectedViaIp = true;
+      } else {
+        // دامنه است → سعی می‌کنیم به IPv4 عمومی resolve کنیم
+        try {
+          final addresses = await InternetAddress.lookup(
+            broker,
+            type: InternetAddressType.IPv4,
+          );
 
-        if (addresses.isNotEmpty) {
-          // اتصال TCP را با IP انجام می‌دهیم تا مشکل IPv6 پیش نیاید
-          hostForClient = addresses.first.address;
-          usingIpInsteadOfDomain = true;
-          // print('MQTT: Connecting via IPv4 ${hostForClient} (domain: $broker)');
+          if (addresses.isNotEmpty) {
+            final ip = addresses.first.address;
+            if (!_isPrivateIp(ip)) {
+              hostForClient = ip;
+              connectedViaIp = true;
+            }
+            // اگر IP خصوصی برگشت، با همان دامنه ادامه می‌دهیم
+          }
+        } catch (_) {
+          // lookup شکست خورد → با دامنه ادامه بده
         }
-      } catch (e) {
-        // اگر lookup شکست خورد، با دامنه ادامه می‌دهیم
-        // print('MQTT: IPv4 lookup failed: $e');
       }
     }
     // ---------------------------------------------------------------
@@ -104,14 +123,18 @@ class MqttService {
     _client!.autoReconnect = true;
     _client!.resubscribeOnAutoReconnect = true;
     _client!.secure = mode == 'tls';
-    _client!.connectTimeoutPeriod = 15000;
+    _client!.connectTimeoutPeriod = 20000;
 
     // وقتی با IP وصل می‌شویم، خطای hostname mismatch رخ می‌دهد.
-    // اینجا فقط در صورتی که گواهی واقعاً برای دامنه ما باشد، آن را قبول می‌کنیم.
-    if (usingIpInsteadOfDomain) {
-      _client!.onBadCertificate = (Object certificate) {
-        if (certificate is X509Certificate) {
-          return _isCertificateForDomain(certificate, broker);
+    // فقط در صورتی قبول می‌کنیم که گواهی واقعاً برای دامنه ما باشد.
+    if (connectedViaIp && mode == 'tls') {
+      final expectedDomain = isAlreadyIp
+          ? 'khanjanhome.duckdns.org' // دامنه ثابت شما
+          : broker;
+
+      _client!.onBadCertificate = (Object cert) {
+        if (cert is X509Certificate) {
+          return _isCertificateForDomain(cert, expectedDomain);
         }
         return false;
       };
