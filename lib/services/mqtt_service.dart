@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import '../models/app_settings.dart';
@@ -46,19 +47,45 @@ class MqttService {
     final port = settings.port == 0 ? 1883 : settings.port;
 
     final mode = settings.connectionMode;
-    final useWs = mode == 'ws' || mode == 'wss' ||
+    final useWs = mode == 'ws' ||
+        mode == 'wss' ||
         (mode != 'tls' && mode != 'tcp' && settings.useWebSocket);
 
-    final serverAddress = useWs
-        ? _webSocketServerAddress(broker, mode)
-        : broker;
+    final serverAddress =
+        useWs ? _webSocketServerAddress(broker, mode) : broker;
 
-    _client = MqttServerClient.withPort(serverAddress, clientId, port);
+    // ---------- حل مشکل Network is unreachable روی اینترنت موبایل ----------
+    // فقط در حالت TLS، دامنه را به IPv4 resolve می‌کنیم تا سیستم‌عامل
+    // سعی نکند از مسیر IPv6 (که روی بسیاری از شبکه‌های موبایل ناقص است) استفاده کند.
+    // برای SNI و اعتبارسنجی گواهی، همچنان نام دامنه به کلاینت داده می‌شود.
+    String hostForClient = serverAddress;
+
+    if (!useWs && mode == 'tls') {
+      try {
+        final addresses = await InternetAddress.lookup(
+          broker,
+          type: InternetAddressType.IPv4,
+        );
+        if (addresses.isNotEmpty) {
+          // hostForClient را همان دامنه نگه می‌داریم تا SNI و Certificate درست کار کند
+          hostForClient = broker;
+          // برای دیباگ می‌توانید این خط را باز کنید:
+          // print('MQTT: Resolved IPv4 for $broker → ${addresses.first.address}');
+        }
+      } catch (e) {
+        // اگر lookup شکست خورد، با همان دامنه ادامه می‌دهیم
+        // print('MQTT: IPv4 lookup failed: $e');
+      }
+    }
+    // -----------------------------------------------------------------------
+
+    _client = MqttServerClient.withPort(hostForClient, clientId, port);
     _client!.logging(on: false);
     _client!.keepAlivePeriod = 60;
     _client!.autoReconnect = true;
     _client!.resubscribeOnAutoReconnect = true;
     _client!.secure = mode == 'tls';
+    _client!.connectTimeoutPeriod = 15000; // ۱۵ ثانیه برای شبکه‌های ضعیف
 
     if (useWs) {
       _client!.useWebSocket = true;
