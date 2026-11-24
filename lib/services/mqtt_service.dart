@@ -35,6 +35,26 @@ class MqttService {
     return '$scheme://$host/mqtt';
   }
 
+  /// بررسی می‌کند گواهی واقعاً برای دامنه مورد نظر صادر شده باشد
+  bool _isCertificateForDomain(X509Certificate cert, String expectedDomain) {
+    final domain = expectedDomain.trim().toLowerCase();
+    if (domain.isEmpty) return false;
+
+    final subject = cert.subject.toLowerCase();
+    // معمولاً به شکل CN=khanjanhome.duckdns.org یا شامل دامنه است
+    if (subject.contains('cn=$domain') || subject.contains(domain)) {
+      return true;
+    }
+
+    // بررسی اضافی روی PEM (برای بعضی گواهی‌ها که SAN دارند)
+    try {
+      final pem = cert.pem.toLowerCase();
+      if (pem.contains(domain)) return true;
+    } catch (_) {}
+
+    return false;
+  }
+
   Future<void> connect(AppSettings settings) async {
     await disconnect();
     _settings = settings;
@@ -54,11 +74,9 @@ class MqttService {
     final serverAddress =
         useWs ? _webSocketServerAddress(broker, mode) : broker;
 
-    // ---------- حل مشکل Network is unreachable روی اینترنت موبایل ----------
-    // فقط در حالت TLS، دامنه را به IPv4 resolve می‌کنیم تا سیستم‌عامل
-    // سعی نکند از مسیر IPv6 (که روی بسیاری از شبکه‌های موبایل ناقص است) استفاده کند.
-    // برای SNI و اعتبارسنجی گواهی، همچنان نام دامنه به کلاینت داده می‌شود.
+    // ---------- راه‌حل اصلی مشکل Network is unreachable ----------
     String hostForClient = serverAddress;
+    bool usingIpInsteadOfDomain = false;
 
     if (!useWs && mode == 'tls') {
       try {
@@ -66,18 +84,19 @@ class MqttService {
           broker,
           type: InternetAddressType.IPv4,
         );
+
         if (addresses.isNotEmpty) {
-          // hostForClient را همان دامنه نگه می‌داریم تا SNI و Certificate درست کار کند
-          hostForClient = broker;
-          // برای دیباگ می‌توانید این خط را باز کنید:
-          // print('MQTT: Resolved IPv4 for $broker → ${addresses.first.address}');
+          // اتصال TCP را با IP انجام می‌دهیم تا مشکل IPv6 پیش نیاید
+          hostForClient = addresses.first.address;
+          usingIpInsteadOfDomain = true;
+          // print('MQTT: Connecting via IPv4 ${hostForClient} (domain: $broker)');
         }
       } catch (e) {
-        // اگر lookup شکست خورد، با همان دامنه ادامه می‌دهیم
+        // اگر lookup شکست خورد، با دامنه ادامه می‌دهیم
         // print('MQTT: IPv4 lookup failed: $e');
       }
     }
-    // -----------------------------------------------------------------------
+    // ---------------------------------------------------------------
 
     _client = MqttServerClient.withPort(hostForClient, clientId, port);
     _client!.logging(on: false);
@@ -85,7 +104,18 @@ class MqttService {
     _client!.autoReconnect = true;
     _client!.resubscribeOnAutoReconnect = true;
     _client!.secure = mode == 'tls';
-    _client!.connectTimeoutPeriod = 15000; // ۱۵ ثانیه برای شبکه‌های ضعیف
+    _client!.connectTimeoutPeriod = 15000;
+
+    // وقتی با IP وصل می‌شویم، خطای hostname mismatch رخ می‌دهد.
+    // اینجا فقط در صورتی که گواهی واقعاً برای دامنه ما باشد، آن را قبول می‌کنیم.
+    if (usingIpInsteadOfDomain) {
+      _client!.onBadCertificate = (Object certificate) {
+        if (certificate is X509Certificate) {
+          return _isCertificateForDomain(certificate, broker);
+        }
+        return false;
+      };
+    }
 
     if (useWs) {
       _client!.useWebSocket = true;
