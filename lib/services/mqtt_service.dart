@@ -37,15 +37,21 @@ class MqttService {
     return '$scheme://$host/mqtt';
   }
 
-  bool _isPrivateIp(String ip) {
+  /// آیا IP جعلی/خصوصی است؟ (مثل 10.10.34.x که اپراتورهای ایرانی برمی‌گردانند)
+  bool _isBadIp(String ip) {
     final parts = ip.split('.');
-    if (parts.length != 4) return false;
+    if (parts.length != 4) return true;
+
     final a = int.tryParse(parts[0]) ?? 0;
     final b = int.tryParse(parts[1]) ?? 0;
-    if (a == 10) return true;
+
+    // محدوده‌های خصوصی و جعلی رایج
+    if (a == 10) return true;                    // 10.x.x.x (شامل 10.10.34.x)
     if (a == 172 && b >= 16 && b <= 31) return true;
     if (a == 192 && b == 168) return true;
     if (a == 127) return true;
+    if (a == 0 || a >= 224) return true;
+
     return false;
   }
 
@@ -63,16 +69,13 @@ class MqttService {
     return false;
   }
 
-  /// Resolve دامنه با DNS-over-HTTPS (Cloudflare) تا از DNS خراب موبایل رد شویم
-  Future<String?> _resolveWithDoH(String domain) async {
+  /// Resolve دامنه با یک سرویس DoH
+  Future<String?> _queryDoH(String domain, String dohUrl) async {
     try {
-      final uri = Uri.parse(
-        'https://cloudflare-dns.com/dns-query?name=$domain&type=A',
-      );
-      final response = await http.get(
-        uri,
-        headers: {'Accept': 'application/dns-json'},
-      ).timeout(const Duration(seconds: 8));
+      final uri = Uri.parse('$dohUrl?name=$domain&type=A');
+      final response = await http
+          .get(uri, headers: {'Accept': 'application/dns-json'})
+          .timeout(const Duration(seconds: 6));
 
       if (response.statusCode != 200) return null;
 
@@ -83,9 +86,8 @@ class MqttService {
       for (final answer in answers) {
         final map = answer as Map<String, dynamic>;
         if (map['type'] == 1) {
-          // نوع A
-          final ip = map['data'] as String?;
-          if (ip != null && !_isPrivateIp(ip)) {
+          final ip = map['data']?.toString();
+          if (ip != null && !_isBadIp(ip)) {
             return ip;
           }
         }
@@ -94,22 +96,22 @@ class MqttService {
     return null;
   }
 
-  /// Resolve دامنه: اول سیستم، اگر خراب بود از DoH استفاده کن
-  Future<String?> _resolveToPublicIpv4(String domain) async {
-    // ۱. اول با DNS سیستم (سریع‌تر)
-    try {
-      final addresses = await InternetAddress.lookup(
-        domain,
-        type: InternetAddressType.IPv4,
-      );
-      if (addresses.isNotEmpty) {
-        final ip = addresses.first.address;
-        if (!_isPrivateIp(ip)) return ip;
-      }
-    } catch (_) {}
+  /// Resolve دامنه با چند سرویس DoH (بدون استفاده از DNS سیستم)
+  Future<String?> _resolveWithDoH(String domain) async {
+    // لیست سرویس‌های DoH عمومی (نیازی به ثبت‌نام نیست)
+    final providers = [
+      'https://cloudflare-dns.com/dns-query', // Cloudflare
+      'https://dns.google/resolve',           // Google
+      'https://dns.quad9.net/dns-query',      // Quad9
+    ];
 
-    // ۲. اگر سیستم IP خصوصی داد یا شکست خورد → از Cloudflare DoH
-    return await _resolveWithDoH(domain);
+    for (final url in providers) {
+      final ip = await _queryDoH(domain, url);
+      if (ip != null) {
+        return ip;
+      }
+    }
+    return null;
   }
 
   Future<void> connect(AppSettings settings) async {
@@ -137,16 +139,26 @@ class MqttService {
 
     if (!useWs && mode == 'tls') {
       if (isAlreadyIp) {
+        // کاربر خودش IP وارد کرده
+        if (_isBadIp(broker)) {
+          throw Exception('آدرس IP وارد شده معتبر نیست');
+        }
         hostForClient = broker;
         connectedViaIp = true;
       } else {
-        // دامنه را به IP عمومی resolve کن (با DoH در صورت نیاز)
-        final resolvedIp = await _resolveToPublicIpv4(broker);
+        // دامنه است → فقط با DoH resolve کن (DNS سیستم را دور بزن)
+        final resolvedIp = await _resolveWithDoH(broker);
+
         if (resolvedIp != null) {
           hostForClient = resolvedIp;
           connectedViaIp = true;
+        } else {
+          // اگر DoH هم شکست خورد، خطا بده (دیگر به DNS سیستم اعتماد نکن)
+          throw Exception(
+            'نتوانست آدرس سرور را پیدا کند.\n'
+            'لطفاً اتصال اینترنت را بررسی کنید یا موقتاً از IP مستقیم استفاده کنید.',
+          );
         }
-        // اگر resolve کامل شکست خورد، با دامنه ادامه می‌دهیم
       }
     }
 
@@ -158,6 +170,7 @@ class MqttService {
     _client!.secure = mode == 'tls';
     _client!.connectTimeoutPeriod = 20000;
 
+    // وقتی با IP وصل می‌شویم، خطای hostname mismatch را فقط برای دامنه خودمان قبول کن
     if (connectedViaIp && mode == 'tls') {
       final expectedDomain =
           isAlreadyIp ? 'khanjanhome.duckdns.org' : broker;
@@ -267,9 +280,7 @@ class MqttService {
 
       final heartbeatTopic = _heartbeatTopicFor(_settings!.espStatusTopic);
       if (topic == heartbeatTopic) {
-        if (recMess.header?.retain == true) {
-          continue;
-        }
+        if (recMess.header?.retain == true) continue;
         _espStatusController.add(true);
         continue;
       }
@@ -294,9 +305,7 @@ class MqttService {
       }
 
       if (topic == _settings!.temperatureTopic) {
-        if (recMess.header?.retain == true) {
-          continue;
-        }
+        if (recMess.header?.retain == true) continue;
         _temperatureController.add(payload);
         _espStatusController.add(true);
         continue;
